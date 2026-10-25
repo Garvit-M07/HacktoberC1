@@ -1,4 +1,13 @@
 node_modules
 .env
-data/db.json
 env.local
+data/db.json
+# Firebase service account keys - NEVER commit these
+firebase-service-account.json
+*firebase-adminsdk*.json
+*service-account*.json
+.firebase
+firebase-debug.log
+deploy.log
+data/*.json
+push.log

@@ -1,4 +1,5 @@
-// NET X server - zero dependencies (Node 18+). Run: node server.js
+// NET X server - zero npm dependencies (Node 18+). Run: node server.js
+// Storage: Firebase Firestore when configured, else data/db.json. Auth: password, Firebase Auth (Google), or Google Identity.
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -11,25 +12,23 @@ loadEnv();
 const { seed } = await import('./lib/seed.js');
 const ai = await import('./lib/ai.js');
 const { status: gemmaStatus } = await import('./lib/gemma.js');
+const { createStore } = await import('./lib/store.js');
+const { verifyFirebaseIdToken, loadServiceAccount, projectId: fbProjectId } = await import('./lib/firebase.js');
+const match = await import('./lib/match.js');
 
 const PORT = +process.env.PORT || 3000;
 const NEARBY_M = +process.env.NEARBY_METERS || 500;
 const LOC_TTL = 10 * 60e3; // location older than 10 min is ignored
-const DB_FILE = path.join(ROOT, 'data', 'db.json');
 const DAY = 864e5;
 
 // ---------------- storage ----------------
 const rid = () => crypto.randomBytes(6).toString('hex');
 const hashPw = (pw, salt) => crypto.scryptSync(String(pw), salt, 32).toString('hex');
-let db;
-if (fs.existsSync(DB_FILE)) db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-else { db = seed(hashPw); persist(true); }
+const store = await createStore(ROOT, () => seed(hashPw));
+const db = store.db;
 let saveTimer;
-function persist(now = false) {
-  const write = () => { fs.mkdirSync(path.dirname(DB_FILE), { recursive: true }); fs.writeFileSync(DB_FILE, JSON.stringify(db)); };
-  if (now) return write();
-  clearTimeout(saveTimer); saveTimer = setTimeout(write, 250);
-}
+function persist() { clearTimeout(saveTimer); saveTimer = setTimeout(() => store.save(), 250); }
+const FB_PROJECT = fbProjectId(loadServiceAccount(ROOT));
 
 const normEmail = (e) => (e ? String(e).trim().toLowerCase() || null : null);
 const normPhone = (p) => { const d = String(p || '').replace(/\D/g, ''); return d.length >= 7 ? d.slice(-10) : null; };
@@ -143,13 +142,16 @@ function suggestions(uid) {
     if (u.id === uid || mine.has(u.personId)) continue;
     const theirs = new Set(contactsOf(u.id).map((c) => c.personId));
     const mutual = [...theirs].filter((p) => mine.has(p));
-    if (!mutual.length && !theirs.has(me.personId)) continue;
+    const profHit = me.profile && u.profile && match.scoreCandidate({ ...me.profile, name: '' }, match.evidenceFor(db, u.personId)).score >= 15;
+    if (!mutual.length && !theirs.has(me.personId) && !profHit) continue;
     const union = new Set([...mine, ...theirs]).size || 1;
     const sharedTags = [...new Set(contactsOf(u.id).flatMap((c) => c.tags))].filter((t) => myTags.has(t));
-    const score = mutual.length / union + (theirs.has(me.personId) ? 0.3 : 0) + sharedTags.length * 0.02;
+    const prof = me.profile && u.profile ? match.scoreCandidate({ ...me.profile, name: '' }, match.evidenceFor(db, u.personId)) : { score: 0, reasons: [] };
+    const score = mutual.length / union + (theirs.has(me.personId) ? 0.3 : 0) + sharedTags.length * 0.02 + prof.score / 200;
     out.push({
       user: publicUser(u), score: +score.toFixed(3), knowsYou: theirs.has(me.personId),
       mutual: mutual.map((p) => personById(p)?.name).filter(Boolean), sharedTags,
+      profileOverlap: me.profile && u.profile ? match.scoreCandidate({ ...me.profile, name: '' }, match.evidenceFor(db, u.personId)).reasons : [],
     });
   }
   return out.sort((a, b) => b.score - a.score).slice(0, 8);
@@ -179,7 +181,52 @@ function newSession(u) { const t = crypto.randomBytes(24).toString('hex'); db.se
 function myContact(uid, id) { const c = db.contacts.find((x) => x.id === id && x.ownerId === uid); must(c, 404, 'Contact not found'); return c; }
 
 // ---------------- routes ----------------
-route('GET', '/api/config', false, () => ({ googleClientId: process.env.GOOGLE_CLIENT_ID || null }));
+route('GET', '/api/config', false, () => ({
+  googleClientId: process.env.GOOGLE_CLIENT_ID || null,
+  // Firebase web config is public by design (it identifies the project, it is not a secret)
+  firebase: FB_PROJECT && process.env.FIREBASE_API_KEY ? {
+    apiKey: process.env.FIREBASE_API_KEY,
+    authDomain: process.env.FIREBASE_AUTH_DOMAIN || `${FB_PROJECT}.firebaseapp.com`,
+    projectId: FB_PROJECT,
+    appId: process.env.FIREBASE_APP_ID || undefined,
+  } : null,
+}));
+
+// Shared by every Google-based sign-in: find the user, or create one + claim a shadow profile by email.
+function signInWithIdentity({ provider, sub, email, name, picture }) {
+  const subKey = provider === 'firebase' ? 'firebaseUid' : 'googleSub';
+  let u = db.users.find((x) => x[subKey] === sub) || (email && db.users.find((x) => x.email && x.email === email));
+  let isNew = false, claimed = false;
+  if (u) {
+    u[subKey] ||= sub; if (picture) u.picture = picture;
+  } else {
+    isNew = true;
+    let person = email && db.persons.find((p) => !p.claimedBy && !p.mergedInto && p.email === email);
+    claimed = !!person;
+    if (!person) person = findOrCreatePerson({ name, email });
+    must(!person.claimedBy, 409, 'That email already belongs to an account');
+    const base = (email || name || 'user').split('@')[0].toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 18) || 'user';
+    let handle = base, n = 1;
+    while (db.users.some((x) => x.handle === handle)) handle = base + ++n;
+    u = { id: rid(), handle, name, email, phone: null, salt: null, passHash: null, [subKey]: sub, picture,
+      personId: person.id, headline: '', bio: '', shareLocation: false, publicNetwork: true, loc: null,
+      profile: null, needsOnboarding: true, dismissedMatches: [], createdAt: Date.now() };
+    person.claimedBy = u.id; person.name = u.name;
+    db.users.push(u);
+  }
+  persist();
+  const indexedBy = db.contacts.filter((c) => c.personId === u.personId && c.ownerId !== u.id).length;
+  return { token: newSession(u), user: publicUser(u), isNew, claimed, indexedBy, needsOnboarding: !!u.needsOnboarding };
+}
+
+// ---- Firebase Authentication (Google provider) ----
+route('POST', '/api/auth/firebase', false, async ({ body }) => {
+  must(FB_PROJECT, 500, 'Firebase is not configured on the server');
+  let c;
+  try { c = await verifyFirebaseIdToken(body.idToken, FB_PROJECT); } catch (e) { throw new HttpError(401, 'Firebase sign-in rejected: ' + e.message); }
+  const email = c.email && c.email_verified ? normEmail(c.email) : null;
+  return signInWithIdentity({ provider: 'firebase', sub: c.sub, email, name: c.name || (c.email || 'New user').split('@')[0], picture: c.picture || null });
+});
 
 // ---- Sign in with Google: verify the ID token with Google, then find/create the user ----
 async function verifyGoogleToken(credential) {
@@ -198,30 +245,10 @@ async function verifyGoogleToken(credential) {
 
 route('POST', '/api/auth/google', false, async ({ body }) => {
   const g = await verifyGoogleToken(body.credential);
-  let u = db.users.find((x) => x.googleSub === g.sub) || db.users.find((x) => x.email && x.email === g.email);
-  let isNew = false, claimed = false;
-  if (u) {
-    u.googleSub ||= g.sub; u.picture = g.picture;
-  } else {
-    isNew = true;
-    // claim a shadow profile someone already created with this email
-    let person = db.persons.find((p) => !p.claimedBy && p.email === g.email);
-    claimed = !!person;
-    if (!person) person = findOrCreatePerson({ name: g.name, email: g.email });
-    const base = g.email.split('@')[0].toLowerCase().replace(/[^a-z0-9_]/g, '').slice(0, 18) || 'user';
-    let handle = base, n = 1;
-    while (db.users.some((x) => x.handle === handle)) handle = base + ++n;
-    u = { id: rid(), handle, name: g.name, email: g.email, phone: null, salt: null, passHash: null, googleSub: g.sub, picture: g.picture,
-      personId: person.id, headline: '', bio: '', shareLocation: false, publicNetwork: true, loc: null, createdAt: Date.now() };
-    person.claimedBy = u.id; person.name = u.name;
-    db.users.push(u);
-  }
-  persist();
-  const indexedBy = db.contacts.filter((c) => c.personId === u.personId && c.ownerId !== u.id).length;
-  return { token: newSession(u), user: publicUser(u), isNew, claimed, indexedBy };
+  return signInWithIdentity({ provider: 'google', sub: g.sub, email: g.email, name: g.name, picture: g.picture });
 });
 
-route('GET', '/api/health', false, () => ({ ok: true, gemma: gemmaStatus, hasKey: !!process.env.GEMMA_API_KEY, model: process.env.GEMMA_MODEL || 'gemma-4-26b-a4b-it' }));
+route('GET', '/api/health', false, () => ({ ok: true, storage: store.mode, storageError: store.lastError || null, gemma: gemmaStatus, hasKey: !!process.env.GEMMA_API_KEY, model: process.env.GEMMA_MODEL || 'gemma-4-26b-a4b-it' }));
 
 route('POST', '/api/register', false, ({ body }) => {
   const handle = String(body.handle || '').trim().toLowerCase();
@@ -237,11 +264,12 @@ route('POST', '/api/register', false, ({ body }) => {
   must(!person.claimedBy, 409, 'That email/phone already belongs to an account');
   const salt = rid();
   const u = { id: rid(), handle, name: String(body.name).trim(), email, phone, salt, passHash: hashPw(body.password, salt), personId: person.id,
-    headline: '', bio: '', shareLocation: false, publicNetwork: true, loc: null, createdAt: Date.now() };
+    headline: '', bio: '', shareLocation: false, publicNetwork: true, loc: null,
+    profile: null, needsOnboarding: true, dismissedMatches: [], createdAt: Date.now() };
   person.claimedBy = u.id; person.name = u.name;
   db.users.push(u);
   const indexedBy = db.contacts.filter((c) => c.personId === person.id).length;
-  return { token: newSession(u), user: publicUser(u), claimed, indexedBy };
+  return { token: newSession(u), user: publicUser(u), claimed, indexedBy, needsOnboarding: true };
 });
 
 route('POST', '/api/login', false, ({ body }) => {
@@ -253,7 +281,8 @@ route('POST', '/api/login', false, ({ body }) => {
 route('POST', '/api/logout', true, ({ token }) => { delete db.sessions[token]; persist(); return { ok: true }; });
 
 route('GET', '/api/me', true, ({ user }) => ({
-  user: { ...publicUser(user), email: user.email, phone: user.phone, shareLocation: user.shareLocation, publicNetwork: user.publicNetwork },
+  user: { ...publicUser(user), email: user.email, phone: user.phone, shareLocation: user.shareLocation, publicNetwork: user.publicNetwork,
+    picture: user.picture || null, needsOnboarding: !!user.needsOnboarding, profile: user.profile || null },
   stats: { contacts: contactsOf(user.id).length, indexedBy: db.contacts.filter((c) => c.personId === user.personId).length },
 }));
 
@@ -279,6 +308,83 @@ route('PATCH', '/api/profile', true, ({ user, body }) => {
   persist();
   return { ok: true };
 });
+
+// ---------------- onboarding + identity matching ----------------
+function matchProfile(user) {
+  const p = user.profile || {};
+  return { ...p, name: user.name, email: user.email, phone: user.phone };
+}
+async function computeMatches(user, { verify = true } = {}) {
+  const profile = matchProfile(user);
+  let you = match.findIdentityMatches(db, user, profile);
+  if (verify) you = await ai.verifyMatches(profile, you);
+  return { you, similar: match.findSimilarUsers(db, user, profile) };
+}
+
+route('POST', '/api/onboarding', true, async ({ user, body }) => {
+  if (typeof body.name === 'string' && body.name.trim()) { user.name = body.name.trim().slice(0, 80); personById(user.personId).name = user.name; }
+  if (body.phone) {
+    const ph = normPhone(body.phone);
+    if (ph && !db.persons.some((p) => p.phone === ph && p.id !== user.personId && p.claimedBy)) { user.phone = ph; personById(user.personId).phone ||= ph; }
+  }
+  user.profile = match.cleanProfile(body);
+  user.needsOnboarding = false;
+  // auto headline from what they told us
+  if (!user.headline) user.headline = [user.profile.role, user.profile.workplace && '@ ' + user.profile.workplace].filter(Boolean).join(' ') || user.profile.school || '';
+  persist();
+  return { ok: true, ...(await computeMatches(user)) };
+});
+
+route('GET', '/api/matches', true, async ({ user }) => computeMatches(user));
+
+// Speak or type "about me" -> Gemma fills the onboarding form
+route('POST', '/api/onboarding/parse', true, async ({ body }) => {
+  must(typeof body.text === 'string' && body.text.trim(), 400, 'Say or type something about yourself');
+  return ai.parseProfile(body.text.slice(0, 4000), { fast: !!body.fast });
+});
+
+// "That's me" - merge a shadow profile into this account.
+route('POST', '/api/claim/:pid', true, async ({ user, params }) => {
+  const target = personById(params.pid);
+  must(target && !target.claimedBy && !target.mergedInto, 404, 'That profile is not available to claim');
+  // only allow claiming something the matcher actually proposed for this user
+  const ok = match.findIdentityMatches(db, user, matchProfile(user), { limit: 50 }).some((m) => m.personId === target.id);
+  must(ok, 403, 'Your profile details do not match that person closely enough');
+  const n = mergePerson(user, target);
+  persist();
+  return { ok: true, merged: n, indexedBy: db.contacts.filter((c) => c.personId === user.personId && c.ownerId !== user.id).length };
+});
+
+route('POST', '/api/matches/:pid/dismiss', true, ({ user, params }) => {
+  user.dismissedMatches = [...new Set([...(user.dismissedMatches || []), params.pid])];
+  persist();
+  return { ok: true };
+});
+
+function mergePerson(user, target) {
+  const mine = user.personId;
+  let moved = 0;
+  for (const c of [...db.contacts]) {
+    if (c.personId !== target.id) continue;
+    if (c.ownerId === user.id) { db.contacts.splice(db.contacts.indexOf(c), 1); continue; } // you had indexed "yourself"
+    const dup = db.contacts.find((x) => x.ownerId === c.ownerId && x.personId === mine);
+    if (dup) { // owner already had you indexed under your account - fold the notes together
+      Object.assign(dup.public, c.public); Object.assign(dup.private, c.private);
+      dup.needs = [...new Set([...(dup.needs || []), ...(c.needs || [])])];
+      dup.tags = [...new Set([...dup.tags, ...c.tags])];
+      dup.knows = [...new Set([...(dup.knows || []), ...(c.knows || [])])];
+      dup.interactions = [...dup.interactions, ...c.interactions].sort((a, b) => a.ts - b.ts);
+      dup.metAt = Math.min(dup.metAt, c.metAt); dup.lastMet = Math.max(dup.lastMet, c.lastMet);
+      db.contacts.splice(db.contacts.indexOf(c), 1);
+    } else c.personId = mine;
+    moved++;
+  }
+  for (const c of db.contacts) if (c.knows?.includes(target.id)) c.knows = [...new Set(c.knows.map((k) => (k === target.id ? mine : k)))];
+  const me = personById(mine);
+  me.email ||= target.email; me.phone ||= target.phone;
+  Object.assign(target, { mergedInto: mine, claimedBy: user.id });
+  return moved;
+}
 
 route('GET', '/api/mesh', true, ({ user }) => buildMesh(user.id));
 
@@ -417,19 +523,23 @@ route('POST', '/api/connect/:uid', true, ({ user, params }) => {
 });
 
 // ---------------- server ----------------
-const server = http.createServer(async (req, res) => {
+// Request handler - used by the standalone server below AND by the Firebase Cloud Function (functions.js)
+export async function handler(req, res) {
   const url = new URL(req.url, 'http://x');
   try {
     if (url.pathname.startsWith('/api/')) {
       const r = routes.find((x) => x.method === req.method && x.re.test(url.pathname));
       must(r, 404, 'No such endpoint');
-      const ctx = { params: url.pathname.match(r.re).groups || {}, query: url.searchParams, body: ['POST', 'PATCH', 'PUT'].includes(req.method) ? await readBody(req) : {} };
+      const ctx = { params: url.pathname.match(r.re).groups || {}, query: url.searchParams, body: ['POST', 'PATCH', 'PUT'].includes(req.method) ? (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body) ? req.body : await readBody(req)) : {} };
       if (r.auth) {
         ctx.token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
         ctx.user = session(ctx.token);
         must(ctx.user, 401, 'Not logged in');
       }
-      return send(res, 200, await r.fn(ctx));
+      const out = await r.fn(ctx);
+      // write changes before replying (Cloud Functions may pause the CPU right after the response)
+      if (req.method !== 'GET') { clearTimeout(saveTimer); await store.save(); }
+      return send(res, 200, out);
     }
     // static files
     const rel = url.pathname === '/' ? '/index.html' : decodeURIComponent(url.pathname);
@@ -444,13 +554,19 @@ const server = http.createServer(async (req, res) => {
     if (!(e instanceof HttpError)) console.error(e);
     send(res, e.code || 500, { error: e.message || 'Server error' });
   }
-});
+}
 
-server.listen(PORT, () => {
+if (!process.env.NETX_NO_LISTEN) {
+for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, async () => { clearTimeout(saveTimer); await store.flush(); process.exit(0); });
+
+http.createServer(handler).listen(PORT, () => {
   console.log(`\n  NET X  →  http://localhost:${PORT}`);
   console.log(`  model: ${process.env.GEMMA_MODEL || 'gemma-4-26b-a4b-it'}   key: ${process.env.GEMMA_API_KEY ? 'loaded' : 'MISSING (.env)'}`);
+  console.log(`  storage: ${store.mode}`);
+  console.log(`  firebase auth: ${FB_PROJECT && process.env.FIREBASE_API_KEY ? 'on (' + FB_PROJECT + ')' : 'off'}`);
   console.log('  demo login: demo / demo\n');
 });
+}
 
 function loadEnv() {
   for (const name of ['.env', 'env.local']) {

@@ -29,10 +29,72 @@
       <label>phone<input name="phone"></label>
     </div>
     <button class="btn primary" type="submit">&gt; ENTER</button>
-    <div id="gsiWrap" hidden><div class="or">— or —</div><div id="gsiBtn"></div></div>
+    <div id="gsiWrap" hidden><div class="or">— or —</div>
+      <button type="button" class="btn google" id="btnFirebaseGoogle" hidden><span class="g">G</span> CONTINUE WITH GOOGLE</button>
+      <div id="gsiBtn"></div></div>
     <p id="authErr" class="err"></p>
     <p class="dim small">demo: <b>demo / demo</b> · try registering with <b>jordan@example.com</b> to claim a shadow profile</p>
   </form>
+</section>
+
+<!-- ============ ONBOARDING ============ -->
+<section id="onboard" class="screen" hidden>
+  <div class="ob-wrap">
+    <div class="ob-head">
+      <span class="brand">NET X</span>
+      <span class="dim small" id="obStep">// identity setup</span>
+    </div>
+
+    <form id="obForm" class="ob-box">
+      <h2>&gt; WHO ARE YOU?</h2>
+      <p class="dim">People you've met may already have you in their network. Tell us about yourself and we'll look for profiles
+        others created for you. Only you see your date of birth and phone number. They're used for matching and never displayed.</p>
+      <div class="voicebox">
+        <div class="vb-head"><b>FASTER:</b> say or type a few sentences about yourself and Gemma fills in the form.</div>
+        <textarea id="obAbout" rows="3" placeholder="e.g. I'm Sooraj Mahesh, born 12 May 2003. I study computer science at Purdue in West Lafayette, I'm a software engineer intern at Stripe, I speak English, Hindi and Malayalam, and I'm into AI and climbing."></textarea>
+        <div class="vb-row">
+          <button type="button" class="btn rec" id="obMic">● SPEAK</button>
+          <button type="button" class="btn primary" id="obFill">FILL FORM WITH GEMMA</button>
+          <span class="dim small" id="obFillStatus"></span>
+        </div>
+      </div>
+      <div class="or-line"><span>or fill it in yourself</span></div>
+      <div class="grid2">
+        <label>full name<input name="name" required></label>
+        <label>date of birth <span class="lock">private</span><input name="dob" type="date"></label>
+        <label>city<input name="city" placeholder="West Lafayette"></label>
+        <label>phone <span class="lock">private</span><input name="phone" placeholder="optional"></label>
+        <label>where do you study<input name="school" placeholder="Purdue University"></label>
+        <label>field / major<input name="field" placeholder="Computer Science"></label>
+        <label>what do you do<input name="role" placeholder="student, backend dev, designer…"></label>
+        <label>where do you work<input name="workplace" placeholder="company / lab / startup"></label>
+      </div>
+      <label>languages you speak <span class="dim">(comma separated)</span><input name="languages" placeholder="English, Hindi, Spanish"></label>
+      <label>interests <span class="dim">(comma separated)</span><input name="interests" placeholder="ai, climbing, jazz"></label>
+      <div class="grid3">
+        <label>linkedin<input name="linkedin" placeholder="optional"></label>
+        <label>github<input name="github" placeholder="optional"></label>
+        <label>instagram<input name="instagram" placeholder="optional"></label>
+      </div>
+      <div class="row"><button type="button" class="btn" id="obSkip">SKIP FOR NOW</button><button class="btn primary">&gt; SCAN THE NETWORK</button></div>
+      <p id="obErr" class="err"></p>
+    </form>
+
+    <div id="obScan" class="ob-box" hidden>
+      <h2>&gt; SCANNING…</h2>
+      <pre id="obScanLog" class="scanlog"></pre>
+    </div>
+
+    <div id="obResults" class="ob-box" hidden>
+      <h2>&gt; IS THIS YOU?</h2>
+      <p class="dim">These profiles were created by people who met you before you joined. Claim one to take it over, along with everything people publicly noted about you.</p>
+      <div id="obYou"></div>
+      <h2 style="margin-top:22px">&gt; PEOPLE LIKE YOU</h2>
+      <p class="dim">Already on NET X. You share a school, workplace, languages or interests.</p>
+      <div id="obSimilar"></div>
+      <div class="row"><button class="btn primary" id="obEnter">&gt; ENTER YOUR NETWORK</button></div>
+    </div>
+  </div>
 </section>
 
 <!-- ============ APP ============ -->

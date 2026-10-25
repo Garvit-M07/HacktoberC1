@@ -1,0 +1,18 @@
+{
+  "hosting": {
+    "public": "public",
+    "ignore": ["firebase.json", "**/.*", "**/node_modules/**"],
+    "rewrites": [
+      { "source": "/api/**", "function": { "functionId": "api", "region": "us-central1" } },
+      { "source": "**", "destination": "/index.html" }
+    ]
+  },
+  "functions": {
+    "source": ".",
+    "runtime": "nodejs20",
+    "ignore": ["node_modules", ".git", "firebase-debug.log", "data/**", "public/**", "*.zip", "*.command", "render.yaml"]
+  },
+  "firestore": {
+    "rules": "firestore.rules"
+  }
+}

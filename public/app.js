@@ -106,46 +106,187 @@ $('#authForm').onsubmit = async (e) => {
   e.preventDefault();
   const f = Object.fromEntries(new FormData(e.target));
   $('#authErr').textContent = '';
-  try {
-    const r = await api('/api/' + authMode, { body: f });
-    S.token = r.token; localStorage.setItem('ni_token', r.token);
-    await boot();
-    if (r.claimed) {
-      print(`SHADOW PROFILE CLAIMED. ${r.indexedBy} people had already indexed you before you joined.`, 'alert');
-      toast(`Welcome! ${r.indexedBy} people already know you here. Open MY PROFILE.`);
-    }
-  } catch (err) { $('#authErr').textContent = err.message; }
+  try { await afterAuth(await api('/api/' + authMode, { body: f })); }
+  catch (err) { $('#authErr').textContent = err.message; }
 };
-// ---- Sign in with Google (Google Identity Services) ----
+
+async function afterAuth(r) {
+  S.token = r.token; localStorage.setItem('ni_token', r.token);
+  S.justJoined = r;
+  await boot();
+}
+
+// ---- Google sign-in: Firebase Authentication (preferred) or Google Identity Services ----
+const FB_SDK = 'https://www.gstatic.com/firebasejs/10.12.2';
 async function initGoogle() {
-  const { googleClientId } = await api('/api/config').catch(() => ({}));
-  if (!googleClientId) return;
+  const cfg = await api('/api/config').catch(() => ({}));
+  if (cfg.firebase) {
+    try {
+      const { initializeApp } = await import(`${FB_SDK}/firebase-app.js`);
+      const fbAuth = await import(`${FB_SDK}/firebase-auth.js`);
+      const auth = fbAuth.getAuth(initializeApp(cfg.firebase));
+      const provider = new fbAuth.GoogleAuthProvider();
+      provider.setCustomParameters({ prompt: 'select_account' });
+      S.fbSignOut = () => fbAuth.signOut(auth);
+      const btn = $('#btnFirebaseGoogle');
+      btn.hidden = false; $('#gsiWrap').hidden = false;
+      btn.onclick = async () => {
+        $('#authErr').textContent = '';
+        btn.textContent = 'CONNECTING…';
+        try {
+          const cred = await fbAuth.signInWithPopup(auth, provider);
+          const idToken = await cred.user.getIdToken();
+          await afterAuth(await api('/api/auth/firebase', { body: { idToken } }));
+        } catch (err) {
+          $('#authErr').textContent = err.code === 'auth/popup-closed-by-user' ? '' : (err.code === 'auth/unauthorized-domain'
+            ? `Add ${location.hostname} to Firebase → Authentication → Settings → Authorized domains` : err.message);
+        } finally { btn.innerHTML = '<span class="g">G</span> CONTINUE WITH GOOGLE'; }
+      };
+      return;
+    } catch (e) { console.warn('firebase sdk failed', e); }
+  }
+  if (!cfg.googleClientId) return;
   await new Promise((ok, fail) => {
     const sc = document.createElement('script');
     sc.src = 'https://accounts.google.com/gsi/client'; sc.async = true; sc.onload = ok; sc.onerror = fail;
     document.head.append(sc);
   }).catch(() => { $('#authErr').textContent = 'Could not load Google sign-in'; });
   if (!window.google?.accounts?.id) return;
-  google.accounts.id.initialize({ client_id: googleClientId, callback: onGoogleCredential });
+  google.accounts.id.initialize({ client_id: cfg.googleClientId, callback: onGoogleCredential });
   google.accounts.id.renderButton($('#gsiBtn'), { theme: 'filled_black', size: 'large', shape: 'rectangular', text: 'continue_with', width: 300 });
   $('#gsiWrap').hidden = false;
 }
 async function onGoogleCredential({ credential }) {
   $('#authErr').textContent = '';
-  try {
-    const r = await api('/api/auth/google', { body: { credential } });
-    S.token = r.token; localStorage.setItem('ni_token', r.token);
-    await boot();
-    if (r.claimed) {
-      print(`SHADOW PROFILE CLAIMED. ${r.indexedBy} people had already indexed you before you joined.`, 'alert');
-      toast(`Welcome! ${r.indexedBy} people already know you here. Open MY PROFILE.`);
-    } else if (r.isNew) print(`Welcome @${r.user.handle}. Hit ● LOG MEETING to index the first person you meet.`);
-  } catch (err) { $('#authErr').textContent = err.message; }
+  try { await afterAuth(await api('/api/auth/google', { body: { credential } })); }
+  catch (err) { $('#authErr').textContent = err.message; }
 }
+
+// ---------------- onboarding: who are you? -> is this you? ----------------
+function showOnboarding(prefill = {}) {
+  $('#auth').hidden = true; $('#app').hidden = true; $('#onboard').hidden = false;
+  $('#obForm').hidden = false; $('#obScan').hidden = true; $('#obResults').hidden = true;
+  const f = $('#obForm');
+  const p = prefill.profile || {};
+  const set = (n, v) => { if (f.elements[n]) f.elements[n].value = v ?? ''; };
+  set('name', prefill.name); set('phone', prefill.phone || '');
+  for (const k of ['dob', 'city', 'school', 'field', 'role', 'workplace']) set(k, p[k]);
+  set('languages', (p.languages || []).join(', ')); set('interests', (p.interests || []).join(', '));
+  for (const k of ['linkedin', 'github', 'instagram']) set(k, p.socials?.[k]);
+  $('#obSkip').hidden = !!prefill.editing;
+  f.elements.name.focus();
+}
+// voice / free-text -> form
+$('#obMic').onclick = () => listen({
+  button: $('#obMic'),
+  onInterim: (t) => { $('#obAbout').value = t; },
+  onFinal: (t) => { $('#obAbout').value = t; $('#obFill').click(); },
+});
+$('#obFill').onclick = async () => {
+  if (rec) rec.stop();
+  const text = $('#obAbout').value.trim();
+  if (!text) { $('#obFillStatus').textContent = 'say or type something first'; return; }
+  const f = $('#obForm');
+  const touched = new Set(); // fields the person edited by hand while Gemma was thinking
+  f.querySelectorAll('.grid2 input, .grid3 input, label > input').forEach((el) => { el.oninput = () => touched.add(el.name); });
+  const fill = (p) => {
+    let n = 0;
+    for (const k of ['name', 'dob', 'city', 'phone', 'school', 'field', 'role', 'workplace', 'languages', 'interests', 'linkedin', 'github', 'instagram']) {
+      const el = f.elements[k], v = p[k];
+      if (!el || touched.has(k) || v == null || v === '' || (Array.isArray(v) && !v.length)) continue;
+      const val = Array.isArray(v) ? v.join(', ') : v;
+      if (el.value === val) continue;
+      el.value = val; el.classList.remove('filled'); void el.offsetWidth; el.classList.add('filled'); n++;
+    }
+    return n;
+  };
+  const seq = (S.fillSeq = (S.fillSeq || 0) + 1);
+  try {
+    // 1) instant rough fill
+    const quick = await api('/api/onboarding/parse', { body: { text, fast: true } });
+    fill(quick);
+    $('#obFillStatus').innerHTML = '<span class="loading">gemma is refining… (~30s)</span> you can keep editing meanwhile';
+    // 2) Gemma's careful read replaces it
+    const p = await api('/api/onboarding/parse', { body: { text } });
+    if (seq !== S.fillSeq) return;
+    const n = fill(p);
+    $('#obFillStatus').textContent = p.source === 'gemma' ? `gemma updated ${n} field${n === 1 ? '' : 's'} - check them, then scan.` : 'gemma unavailable, kept the quick fill - check the fields.';
+  } catch (err) { $('#obFillStatus').textContent = err.message; }
+};
+$('#obSkip').onclick = async () => {
+  await api('/api/onboarding', { body: { name: S.me.name } }).catch(() => {});
+  enterApp();
+};
+$('#obForm').onsubmit = async (e) => {
+  e.preventDefault();
+  const f = Object.fromEntries(new FormData(e.target));
+  $('#obErr').textContent = '';
+  $('#obForm').hidden = true; $('#obScan').hidden = false;
+  const log = $('#obScanLog'); log.innerHTML = '';
+  const line = (t, red) => { const d = document.createElement('div'); if (red) d.className = 'r'; d.textContent = t; log.append(d); };
+  const steps = ['> indexing your profile…', '> scanning shadow profiles created by people you may have met…',
+    `> comparing name, school${f.workplace ? ', workplace' : ''}${f.languages ? ', languages' : ''}…`, '> asking gemma 4 to double-check candidates…'];
+  let i = 0; const tick = setInterval(() => { if (i < steps.length) line(steps[i++]); }, 450);
+  try {
+    const [r] = await Promise.all([api('/api/onboarding', { body: f }), new Promise((ok) => setTimeout(ok, 1900))]);
+    clearInterval(tick); while (i < steps.length) line(steps[i++]);
+    line(`> ${r.you.length} possible match${r.you.length === 1 ? '' : 'es'} · ${r.similar.length} people like you`, true);
+    await new Promise((ok) => setTimeout(ok, 500));
+    S.me = { ...S.me, name: f.name };
+    renderMatches(r);
+  } catch (err) {
+    clearInterval(tick); $('#obScan').hidden = true; $('#obForm').hidden = false; $('#obErr').textContent = err.message;
+  }
+};
+
+function renderMatches(r) {
+  $('#obScan').hidden = true; $('#obResults').hidden = false;
+  $('#obYou').innerHTML = r.you.length ? r.you.map((m) => `
+    <div class="match ${m.verdict === 'same' ? 'same' : ''}" data-p="${m.personId}">
+      <div class="pct">${m.confidence}%<small>${m.verdict === 'same' ? 'LIKELY YOU' : 'MAYBE'}</small></div>
+      <div>
+        <div class="nm">${esc(m.name)}</div>
+        <div class="why">indexed by ${esc(m.indexedBy.join(', ') || 'someone')}${m.metAt.length ? ' · met at ' + esc(m.metAt.join(', ')) : ''}</div>
+        <div class="why">matched on: ${esc(m.reasons.join(' · '))}</div>
+        ${m.why ? `<div class="why">gemma: ${esc(m.why)}</div>` : ''}
+      </div>
+      <div class="acts"><button class="btn primary" data-claim>THAT'S ME</button><button class="btn" data-dismiss>NOT ME</button></div>
+    </div>`).join('') : '<p class="dim">No existing profiles matched. Nobody has indexed you yet, so you\'re starting fresh.</p>';
+  $('#obSimilar').innerHTML = r.similar.length ? r.similar.map((s) => `
+    <div class="match" data-u="${s.user.id}">
+      <div class="pct">${s.score}<small>OVERLAP</small></div>
+      <div><div class="nm">${esc(s.user.name)} <span class="dim">@${esc(s.user.handle)}</span></div>
+        <div class="why">${esc(s.user.headline || '')}</div><div class="why">${esc(s.reasons.join(' · '))}</div></div>
+      <div class="acts"><button class="btn" data-connect>+ CONNECT</button></div>
+    </div>`).join('') : '<p class="dim">Nobody with an overlapping profile yet.</p>';
+  $('#obYou').querySelectorAll('.match').forEach((el) => {
+    const pid = el.dataset.p;
+    el.querySelector('[data-claim]').onclick = async (ev) => {
+      ev.target.textContent = 'CLAIMING…';
+      try {
+        const res = await api('/api/claim/' + pid, { method: 'POST' });
+        el.classList.add('done'); el.querySelector('.acts').innerHTML = `<span class="badge solid">CLAIMED · ${res.merged} records</span>`;
+        S.claimedCount = (S.claimedCount || 0) + res.merged;
+      } catch (err) { ev.target.textContent = "THAT'S ME"; toast(err.message); }
+    };
+    el.querySelector('[data-dismiss]').onclick = async () => {
+      await api(`/api/matches/${pid}/dismiss`, { method: 'POST' }).catch(() => {});
+      el.remove();
+    };
+  });
+  $('#obSimilar').querySelectorAll('.match').forEach((el) => {
+    el.querySelector('[data-connect]').onclick = async (ev) => {
+      await api('/api/connect/' + el.dataset.u, { method: 'POST' });
+      ev.target.textContent = '✓ ADDED'; ev.target.disabled = true;
+    };
+  });
+}
+$('#obEnter').onclick = () => enterApp();
 
 async function logout(silent) {
   if (!silent) await api('/api/logout', { method: 'POST' }).catch(() => {});
   try { window.google?.accounts?.id?.disableAutoSelect(); } catch {}
+  try { await S.fbSignOut?.(); } catch {}
   localStorage.removeItem('ni_token'); S.token = null;
   if (S.locWatch) navigator.geolocation.clearWatch(S.locWatch);
   location.reload();
@@ -155,8 +296,23 @@ $('#btnLogout').onclick = () => logout();
 async function boot() {
   const r = await api('/api/me');
   S.me = r.user;
-  $('#auth').hidden = true; $('#app').hidden = false;
+  if (S.me.needsOnboarding) return showOnboarding(S.me);
+  await enterApp(r);
+}
+
+let appStarted = false;
+async function enterApp(meResp) {
+  const r = meResp || await api('/api/me');
+  S.me = r.user;
+  $('#auth').hidden = true; $('#onboard').hidden = true; $('#app').hidden = false;
+  if (appStarted) { await loadMesh(); return; }
+  appStarted = true;
   print(`NET X online. user=${S.me.handle} · ${r.stats.contacts} people indexed · ${r.stats.indexedBy} people indexed you`);
+  const j = S.justJoined; S.justJoined = null;
+  if (j?.claimed || S.claimedCount) {
+    print(`SHADOW PROFILE CLAIMED. ${r.stats.indexedBy} people had already indexed you before you joined.`, 'alert');
+    toast(`Welcome! ${r.stats.indexedBy} people already know you here. Open MY PROFILE.`);
+  } else if (j?.isNew) print(`Welcome @${S.me.handle}. Hit ● LOG MEETING to index the first person you meet.`);
   print('Type a question for the agent, or /help. Click any dot to inspect.');
   api('/api/health').then((h) => setStatus(h)).catch(() => {});
   setLocButton();
@@ -166,7 +322,7 @@ async function boot() {
   setInterval(pollNearby, 15000);
 }
 function setStatus(h) {
-  $('#status').textContent = `${h.model} · key ${h.hasKey ? 'ok' : 'MISSING'}${h.gemma?.ok === false ? ' · gemma err' : ''}`;
+  $('#status').textContent = `${h.model} · key ${h.hasKey ? 'ok' : 'MISSING'}${h.gemma?.ok === false ? ' · gemma err' : ''} · ${/firestore/.test(h.storage) ? 'firebase' : 'local db'}${h.storageError ? ' · DB ERR' : ''}`;
 }
 
 // ---------------- mesh data + layout ----------------
@@ -646,6 +802,7 @@ $('#btnProfile').onclick = async () => {
     <form id="pform">
       <label>headline<input name="headline" value="${esc(p.user.headline)}"></label>
       <label>bio<textarea name="bio">${esc(p.user.bio)}</textarea></label>
+      <div class="actions" style="margin:10px 0 4px"><button type="button" class="btn" data-a="details">EDIT IDENTITY DETAILS</button><button type="button" class="btn" data-a="findme">FIND PROFILES OF ME</button></div>
       <label class="check"><input type="checkbox" name="publicNetwork" ${p.user.publicNetwork ? 'checked' : ''}> let people I know open my mesh</label>
       <label class="check"><input type="checkbox" name="shareLocation" ${p.user.shareLocation ? 'checked' : ''}> share location with mutual close friends</label>
       <div class="row"><button class="btn primary">SAVE</button></div>
@@ -657,6 +814,12 @@ $('#btnProfile').onclick = async () => {
     <p class="dim small">Private notes others keep about you are never visible to anyone but them.</p>
     <div class="row"><button class="btn" data-a="cancel">CLOSE</button></div>`);
   $('[data-a=cancel]').onclick = closeModal;
+  $('[data-a=details]').onclick = async () => { closeModal(); const me = (await api('/api/me')).user; showOnboarding({ ...me, editing: true }); };
+  $('[data-a=findme]').onclick = async () => {
+    closeModal(); $('#app').hidden = true; $('#onboard').hidden = false; $('#obForm').hidden = true;
+    $('#obScan').hidden = false; $('#obScanLog').textContent = '> scanning the network for profiles of you…';
+    renderMatches(await api('/api/matches'));
+  };
   $('#pform').onsubmit = async (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
