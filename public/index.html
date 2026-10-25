@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NET X</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;800&family=VT323&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<!-- ============ AUTH ============ -->
+<section id="auth" class="screen">
+  <pre class="logo">
+ _   _ _____ _____   __  __
+| \ | | ____|_   _|  \ \/ /
+|  \| |  _|   | |     \  /
+| |\  | |___  | |     /  \
+|_| \_|_____| |_|    /_/\_\</pre>
+  <p class="dim">the index of everyone you meet in real life. powered by gemma 4.</p>
+  <form id="authForm" class="box">
+    <div class="tabs"><button type="button" data-mode="login" class="on">LOGIN</button><button type="button" data-mode="register">REGISTER</button></div>
+    <label>handle<input name="handle" autocomplete="username" required></label>
+    <label>password<input name="password" type="password" autocomplete="current-password" required></label>
+    <div class="reg-only">
+      <label>full name<input name="name"></label>
+      <label>email <span class="dim">(claims your shadow profile if someone indexed you)</span><input name="email" type="email"></label>
+      <label>phone<input name="phone"></label>
+    </div>
+    <button class="btn primary" type="submit">&gt; ENTER</button>
+    <div id="gsiWrap" hidden><div class="or">— or —</div><div id="gsiBtn"></div></div>
+    <p id="authErr" class="err"></p>
+    <p class="dim small">demo: <b>demo / demo</b> · try registering with <b>jordan@example.com</b> to claim a shadow profile</p>
+  </form>
+</section>
+
+<!-- ============ APP ============ -->
+<section id="app" class="screen" hidden>
+  <header>
+    <span class="brand">NET X</span>
+    <nav>
+      <button class="btn rec" id="btnLog" title="Speak about someone you just met">● LOG MEETING</button>
+      <button class="btn" id="btnAdd">+ MANUAL</button>
+      <button class="btn" id="btnSuggest">SIMILAR NETWORKS</button>
+      <button class="btn" id="btnClose">CLOSE FRIENDS</button>
+      <button class="btn" id="btnProfile">MY PROFILE</button>
+      <button class="btn" id="btnLoc">LOC: OFF</button>
+      <button class="btn" id="btnLogout">EXIT</button>
+    </nav>
+    <span id="status" class="dim small"></span>
+  </header>
+
+  <main>
+    <canvas id="mesh"></canvas>
+    <div id="viewBanner" hidden></div>
+    <div id="legend" class="small">
+      <div><i class="dot fill"></i> on network</div>
+      <div><i class="dot hollow"></i> shadow profile</div>
+      <div><i class="dot ring"></i> close friend</div>
+      <div><i class="dot pulse"></i> nearby now</div>
+      <div class="dim">center = recent · edge = 3y+</div>
+      <div class="dim">scroll zoom · drag pan · F find</div>
+    </div>
+    <input id="find" placeholder="find person…" hidden>
+    <aside id="panel" hidden></aside>
+  </main>
+
+  <section id="term">
+    <div id="log"></div>
+    <form id="cmd">
+      <span class="prompt">link@netx:~$</span>
+      <input id="cmdInput" autocomplete="off" placeholder="ask the agent anything about your network… (/help)">
+      <button type="button" class="btn mic" id="btnMic" title="Talk to the agent">MIC</button>
+      <button type="button" class="btn" id="btnTts" title="Speak replies">VOICE: OFF</button>
+    </form>
+  </section>
+</section>
+
+<div id="modal" hidden><div class="modal-box"></div></div>
+<div id="toasts"></div>
+
+<script src="/app.js" type="module"></script>
+</body>
+</html>

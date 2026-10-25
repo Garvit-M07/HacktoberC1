@@ -1,0 +1,12 @@
+{
+  "name": "netx",
+  "version": "0.1.0",
+  "description": "Voice-enabled real-life social network index powered by Gemma 4",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "reset": "rm -f data/db.json && node server.js"
+  },
+  "engines": { "node": ">=18" }
+}
